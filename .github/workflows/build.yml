@@ -1,0 +1,165 @@
+name: Build TA-Lib-python wheels for Windows and linux
+
+on:
+  workflow_dispatch:  # 允许手动触发工作流程，方便手动构建
+  push:
+    tags:
+      - 'v*.*.*' # 当推送匹配 'v*.*.*' 格式的标签时触发工作流程，用于发布 release 版本
+
+env:
+  TALIB_C_VER: 0.6.4  # TA-Lib C 库版本
+  TALIB_PY_VER: 0.6.3  # TA-Lib Python 包版本
+  PIP_NO_VERIFY: 0    # pip 安装时是否跳过 SSL 证书验证 (0: 否, 1: 是)
+  PIP_VERBOSE: 1      # pip 安装时显示详细输出 (0: 否, 1: 是)
+  CIBW_BUILD_VERBOSITY: 2  # cibuildwheel 构建时的详细程度 (0-3, 越高越详细)
+  CIBW_BEFORE_BUILD: pip install -U setuptools wheel numpy Cython 
+  CIBW_TEST_REQUIRES: pytest pandas polars
+  CIBW_TEST_COMMAND: >  # cibuildwheel 运行测试的命令
+    pytest {project}/tests -k "not RSI and not threading" --verbose
+  CIBW_TEST_SKIP: "*win32 cp37* cp38* cp39*" # cibuildwheel 跳过构建 wheel 的平台和 Python 版本组合
+  CIBW_SKIP: "pp* cp36* cp37* *-manylinux_i686 *-musllinux*"  # cibuildwheel 跳过构建 wheel 的平台和 Python 版本组合
+  MSBUILDTREATHIGHERTOOLSVERSIONASCURRENT: 1  # MSBuild 使用最新的工具集版本
+
+jobs:
+  build_wheels:
+    name: Build wheels for ${{ matrix.os }} Py${{ matrix.python-version }} (${{ matrix.arch_config.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest,ubuntu-20.04]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        arch_config:
+          - { cibw: 'x86',   platform: 'win32',     vs_arch: 'x86' }
+          - { cibw: 'AMD64', platform: 'win_amd64', vs_arch: 'x64' }
+          - { cibw: 'x86_64', platform: 'manylinux_2_17_x86_64', vs_arch: 'x64' }
+        exclude:
+          - os: ubuntu-20.04
+            arch_config: { cibw: 'x86', platform: 'win32', vs_arch: 'x86'}
+          - os: ubuntu-20.04
+            arch_config: { cibw: 'AMD64', platform: 'win_amd64', vs_arch: 'x64' }
+          - os: ubuntu-20.04
+            arch_config: { cibw: 'x86_64', platform: 'manylinux_2_17_x86_64', vs_arch: 'x86' }
+          - os: windows-latest
+            arch_config: { cibw: 'x86_64', platform: 'manylinux_2_17_x86_64', vs_arch: 'x64'}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC Developer Command Prompt # Only for Windows
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch_config.vs_arch == 'x86' && 'amd64_x86' || 'amd64' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.arch_config.vs_arch }}
+
+      - name: Build TA-Lib C library (Windows)
+        if: runner.os == 'Windows'
+        run: build.cmd
+        shell: cmd
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential autoconf automake libtool
+          echo "Autoconf version:"
+          autoconf --version # Verify the version after install
+
+      - name: Install newer Autoconf (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          REQUIRED_VER="2.71"
+          INSTALLED_VER=$(autoconf --version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "0")
+
+          if dpkg --compare-versions "$INSTALLED_VER" "lt" "$REQUIRED_VER"; then
+            echo "Autoconf version $INSTALLED_VER is too old. Installing >= $REQUIRED_VER."
+            AUTOCONF_INSTALL_VER="2.72" # Pick a specific recent version
+            AUTOCONF_TAR="autoconf-${AUTOCONF_INSTALL_VER}.tar.gz"
+            AUTOCONF_URL="https://ftp.gnu.org/gnu/autoconf/${AUTOCONF_TAR}"
+            
+            cd /tmp
+            wget -q "${AUTOCONF_URL}"
+            tar -xzf "${AUTOCONF_TAR}"
+            cd "autoconf-${AUTOCONF_INSTALL_VER}"
+            ./configure --prefix=/usr/local # Installs to /usr/local/bin
+            make
+            sudo make install
+            cd /
+            rm -rf "/tmp/autoconf-${AUTOCONF_INSTALL_VER}" "${AUTOCONF_TAR}"
+          else
+            echo "Autoconf version $INSTALLED_VER is sufficient."
+          fi
+          echo "Using Autoconf version:"
+          autoconf --version # Verify
+        shell: bash
+
+      - name: Build TA-Lib C library (Linux)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x build.sh
+          ./build.sh
+        shell: bash
+
+      - name: Install cibuildwheel
+        run: |
+          python -m pip install cibuildwheel 
+
+      - name: Build wheels window
+        if: runner.os == 'Windows'
+        env:
+          CIBW_ARCHS_WINDOWS: ${{ matrix.arch_config.cibw }}
+          CIBW_ARCHS_LINUX: ${{ matrix.arch_config.cibw }}
+          CIBW_ENVIRONMENT_WINDOWS: >  # 设置 cibuildwheel 构建 Windows 环境时的环境变量
+            TA_LIBRARY_PATH="ta-lib-$TALIB_C_VER\\_build;$LIB"
+            TA_INCLUDE_PATH="ta-lib-$TALIB_C_VER\\include;$INCLUDE"
+            PIP_NO_BUILD_ISOLATION=false
+          PIP_NO_BUILD_ISOLATION: false # Only if necessary. Use `true` if possible
+
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Build wheels linux
+        if: runner.os != 'Windows'
+        env:
+          CIBW_ENVIRONMENT_LINUX: >
+            TA_LIBRARY_PATH="/project/lib"
+            TA_INCLUDE_PATH="/project/include"
+            LD_LIBRARY_PATH="/project/lib:$LD_LIBRARY_PATH"
+            PIP_NO_BUILD_ISOLATION="false"
+
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: talib-${{ env.TALIB_PY_VER }}-${{ runner.os }}-py${{ matrix.python-version }}-${{ matrix.arch_config.platform }} # Include OS in name
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  release_wheels:
+    name: Release wheels to GitHub Releases
+    runs-on: ubuntu-latest
+    needs: build_wheels  # 依赖 build_wheels Job，确保 build_wheels 完成后才运行
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')  # 仅在 push 标签 (以 'v' 开头) 时运行 Release Job
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: talib-*  # 下载所有匹配 "talib-" 前缀的 artifacts (即 build_wheels Job 上传的 wheels)
+          path: dist  # 下载到 dist 目录
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: ls -R dist
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.whl
+          name: Release ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # asset_name: ${{ github.event.repository.name }}-${{ github.ref_name }}-${{ github.run_id }}-${{ matrix.os }}-${{ matrix.python_version }}-${{ matrix.arch_config.platform }} # Asset 名称，可以自定义，这里包含仓库名、标签名、run ID 等信息
