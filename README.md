@@ -1,7 +1,3 @@
-Okay, here is the README content in both English and Chinese, based on the provided workflow file.
-
----
-
 **English:**
 
 # TA-Lib Pre-built Wheels (Windows & Linux x64)
